@@ -1,0 +1,19 @@
+name: Weekly Summary Sunday 9AM
+on:
+  schedule:
+    # Sunday 9 AM IST = 03:30 UTC, Day 0 = Sunday
+    - cron: '30 3 * * 0'
+  workflow_dispatch:
+jobs:
+  summary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python weekly_summary.py
+        env:
+          TELEGRAM_TOKEN_HOLDINGS: ${{ secrets.TELEGRAM_TOKEN_HOLDINGS }}
+          TELEGRAM_CHAT_ID_HOLDINGS: ${{ secrets.TELEGRAM_CHAT_ID_HOLDINGS }}
