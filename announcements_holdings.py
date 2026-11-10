@@ -145,7 +145,8 @@ try:
         json.dump(sent_history, f, indent=2)
 
     if sent_now == 0:
-        send_text(f"✅ <b>Holdings Check - {today_display} {now.strftime('%I:%M %p')}</b>\n\nNo NEW announcements since last check.\n\nChecked {len(symbols)} stocks.")
+        print(f"No NEW announcements - Staying silent, no Telegram message sent.")
+        # Silent - Do not send "No NEW" message to avoid spam
     else:
         send_text(f"✅ <b>Done - {today_display} {now.strftime('%I:%M %p')}</b>\n\nNew PDFs sent: {sent_now}\nStocks: {', '.join(with_news)}")
 
