@@ -1,17 +1,32 @@
 name: Holdings Announcements 7PM
+
 on:
   schedule:
+    # 7:00 PM IST = 13:30 UTC
     - cron: '30 13 * * *'
+    # 10:00 PM IST = 16:30 UTC - late evening catch-up
     - cron: '30 16 * * *'
+    # 8:00 AM IST = 02:30 UTC - morning catch-up (catches late night bulk/block)
     - cron: '30 2 * * *'
   workflow_dispatch:
+
+# Prevent 2 runs overlapping and overwriting sent_history.json
+concurrency:
+  group: holdings-announcements
+  cancel-in-progress: false
+
 jobs:
   send:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          # FIX 1: Full history needed for git pull + push to work
+          fetch-depth: 0
+
       - name: Debug - List files
         run: |
           echo "=== FILES ==="
@@ -19,19 +34,51 @@ jobs:
           echo "=== REQUIREMENTS ==="
           cat requirements.txt || echo "NO requirements.txt"
           echo "=== CHECK PYTHON FILE ==="
-          ls -lh announcements_holdings.py holdings.json sent_history.json || echo "MISSING FILE"
+          ls -lh announcements_holdings.py holdings.json sent_history.json || echo "MISSING FILE (sent_history will be created)"
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python announcements_holdings.py
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          # Safety: ensure these exist even if requirements.txt is old
+          pip install -q fpdf2 pytz requests || true
+
+      - name: Run bot
+        run: python announcements_holdings.py
         env:
           TELEGRAM_TOKEN_HOLDINGS: ${{ secrets.TELEGRAM_TOKEN_HOLDINGS }}
           TELEGRAM_CHAT_ID_HOLDINGS: ${{ secrets.TELEGRAM_CHAT_ID_HOLDINGS }}
+
       - name: Save sent history
+        # Always run, even if python script fails, so we don't lose history
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # FIX 2: Pull latest before push, or push will conflict
+          git pull --rebase origin main || git pull --rebase origin master || echo "Pull failed, continuing"
+          
           git add sent_history.json || true
-          git commit -m "Update sent history" || echo "No changes"
-          git push || echo "Push failed - ignore"
+          
+          # Only commit if file actually changed
+          if git diff --cached --quiet; then
+            echo "No changes to sent_history.json, skipping commit"
+          else
+            git commit -m "Update sent history - $(date -u +'%Y-%m-%d %H:%M UTC')"
+            # Retry push 3 times - if another run pushed in between
+            for i in 1 2 3; do
+              if git push; then
+                echo "Push OK"
+                break
+              else
+                echo "Push failed, attempt $i - pulling and retrying"
+                git pull --rebase origin main || git pull --rebase origin master || true
+                sleep 3
+              fi
+            done
+          fi
