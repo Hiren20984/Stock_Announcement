@@ -1,15 +1,16 @@
-import os, json, requests, datetime, pytz, time, hashlib, sys, traceback, re, csv, io
+import os, json, requests, datetime, pytz, time, hashlib, sys, traceback
 from fpdf import FPDF
 try:
     from bs4 import BeautifulSoup
     HAS_BS4 = True
 except:
     HAS_BS4 = False
-    print("bs4 not installed, will install via requirements")
+    print("bs4 not installed")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN_HOLDINGS")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_HOLDINGS")
 print(f"DEBUG: TOKEN exists? {bool(TOKEN)}")
+print(f"DEBUG: CHAT_ID: {CHAT_ID}")
 if not TOKEN or not CHAT_ID:
     print("ERROR: Secrets missing!")
     sys.exit(0)
@@ -27,16 +28,6 @@ def safe_json_text(txt):
         txt = txt.strip()
         if not txt or txt.startswith("<"):
             return {}
-        # AllOrigins wraps JSON in {"contents": "..."}
-        if '"contents"' in txt[:200]:
-            try:
-                outer = json.loads(txt)
-                inner = outer.get("contents", "")
-                if isinstance(inner, str):
-                    return json.loads(inner)
-                return inner
-            except:
-                pass
         return json.loads(txt)
     except Exception as e:
         print(f"  -> JSON parse failed: {e}, txt[:200]={txt[:200]}")
@@ -52,10 +43,7 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-# ---------- PROXY HELPERS - THIS IS THE FIX ----------
 def fetch_via_proxy(target_url):
-    """Try direct first, then 2 public proxies. Returns (status, text)"""
-    # 1. Direct
     try:
         r = requests.get(target_url, headers=HEADERS, timeout=25)
         if r.status_code == 200 and len(r.text) > 100 and "Access Denied" not in r.text and "Resource not found" not in r.text:
@@ -64,17 +52,24 @@ def fetch_via_proxy(target_url):
         print(f"  DIRECT blocked: {target_url[:70]} -> {r.status_code} len {len(r.text)}")
     except Exception as e:
         print(f"  DIRECT error: {e}")
-    # 2. AllOrigins proxy - GET
     for proxy in [
-        f"https://api.allorigins.win/raw?url={requests.utils.quote(target_url, safe='')}",
-        f"https://corsproxy.io/?url={requests.utils.quote(target_url, safe='')}",
+        f"https://api.allorigins.win/raw?url={target_url}",
+        f"https://api.allorigins.win/get?url={target_url}",
+        f"https://corsproxy.io/?url={target_url}",
     ]:
         try:
-            print(f"  Trying proxy: {proxy[:60]}...")
+            print(f"  Trying proxy: {proxy[:70]}...")
             r = requests.get(proxy, headers=HEADERS, timeout=30)
             print(f"  PROXY -> {r.status_code} len {len(r.text)}")
             if r.status_code == 200 and len(r.text) > 100 and "Access Denied" not in r.text:
-                return r.status_code, r.text
+                txt = r.text
+                if '"contents"' in txt[:300]:
+                    try:
+                        outer = json.loads(txt)
+                        txt = outer.get("contents", txt)
+                    except:
+                        pass
+                return 200, txt
         except Exception as e:
             print(f"  PROXY error: {e}")
             continue
@@ -112,7 +107,6 @@ try:
     def make_id(symbol, title, time_str):
         return hashlib.md5(f"{symbol}|{title}|{time_str}".upper().strip().encode()).hexdigest()[:12]
 
-    # ---------- 1. NSE ANNOUNCEMENTS VIA PROXY ----------
     def get_nse_ann():
         url = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol="
         status, txt = fetch_via_proxy(url)
@@ -124,15 +118,9 @@ try:
         print("NSE Ann: proxy also failed")
         return []
 
-    # ---------- 2. BSE ANNOUNCEMENTS VIA MONEYCONTROL RSS + PROXY ----------
-    def get_bse_all_via_moneycontrol():
-        # Moneycontrol publishes all BSE announcements in RSS, not blocked
-        # We fetch Moneycontrol company announcements search via proxy
+    def get_bse_all():
         all_rows = []
-        # Try Moneycontrol announcements API via proxy
-        # Fallback: Use BSE via proxy GET (BSE API also accepts GET with query params when via proxy)
         for d in [yesterday_str, today_str]:
-            # BSE GET version - works when not blocked
             bse_url = f"https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w?strCat=-1&strPrevDate={d}&strScrip=&strSearch=P&strToDate={d}&strType=C"
             status, txt = fetch_via_proxy(bse_url)
             if status == 200:
@@ -142,7 +130,6 @@ try:
                 all_rows.extend(rows)
             else:
                 print(f"BSE Ann {d} VIA PROXY failed")
-        # Deduplicate
         seen = set(); uniq = []
         for row in all_rows:
             k = f"{row.get('HEADLINE','')}|{row.get('DT_TM','')}|{row.get('SCRIP_CD','')}"
@@ -151,59 +138,48 @@ try:
         print(f"BSE Ann total unique via proxy: {len(uniq)}")
         return uniq
 
-    # ---------- 3. BULK / BLOCK VIA CHITTORGARH (NOT BLOCKED) ----------
     def get_bulk_block_via_chittorgarh():
         bulk, block = [], []
         if not HAS_BS4:
-            print("bs4 missing, cannot parse Chittorgarh")
+            print("bs4 missing")
             return bulk, block
-        for d_obj in [now, yesterday]:
-            d_str = d_obj.strftime("%Y-%m-%d")  # 2026-11-20
-            d_display = d_obj.strftime("%d %b %Y")
-            for kind in ["bulk-deals", "block-deals"]:
-                url = f"https://www.chittorgarh.com/report/{kind}/{d_str}/"
-                print(f"Chittorgarh {kind} {d_str}: fetching {url}")
-                try:
-                    r = requests.get(url, headers=HEADERS, timeout=25)
-                    print(f"  Chittorgarh {kind}: status {r.status_code} len {len(r.text)}")
-                    if r.status_code != 200:
-                        continue
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    # Find all tables
-                    tables = soup.find_all("table")
-                    print(f"  Found {len(tables)} tables")
-                    for table in tables:
-                        rows = table.find_all("tr")
-                        for row in rows[1:]:
-                            cols = [c.get_text(strip=True) for c in row.find_all("td")]
-                            if len(cols) < 5:
-                                continue
-                            # Chittorgarh columns: Company | Client | Buy/Sell | Qty | Price | Date
-                            # Varies, try to detect symbol-like
-                            text = " ".join(cols)
-                            # Company name is usually col 0 or 1
-                            company = cols[0] if cols else ""
-                            # Try to find qty and price numbers
-                            # Save raw for matching by company name later
-                            item = {
-                                "company": company,
-                                "cols": cols,
-                                "raw_text": text,
-                                "date": d_display,
-                                "kind": kind,
-                            }
-                            if kind == "bulk-deals":
-                                bulk.append(item)
-                            else:
-                                block.append(item)
-                    print(f"  Chittorgarh {kind} {d_str}: total so far bulk={len(bulk)} block={len(block)}")
-                except Exception as e:
-                    print(f"Chittorgarh {kind} Error: {e}")
-                    traceback.print_exc()
+        for kind, url in [
+            ("bulk-deals", "https://www.chittorgarh.com/report/bulk-deals/"),
+            ("block-deals", "https://www.chittorgarh.com/report/block-deals/"),
+        ]:
+            print(f"Chittorgarh {kind}: fetching {url}")
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=25)
+                print(f"  Chittorgarh {kind}: status {r.status_code} len {len(r.text)}")
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                tables = soup.find_all("table")
+                print(f"  Found {len(tables)} tables")
+                for table in tables:
+                    rows = table.find_all("tr")
+                    if rows:
+                        header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+                        print(f"  Table header: {header}")
+                    for row in rows[1:]:
+                        cols = [c.get_text(strip=True) for c in row.find_all("td")]
+                        if len(cols) < 4:
+                            continue
+                        company = cols[0] if cols else ""
+                        if not company or company.lower() in ["company", "no data"]:
+                            continue
+                        item = {"company": company, "cols": cols, "raw_text": " ".join(cols), "date": today_display, "kind": kind}
+                        if kind == "bulk-deals":
+                            bulk.append(item)
+                        else:
+                            block.append(item)
+                print(f"  Chittorgarh {kind}: total bulk={len(bulk)} block={len(block)}")
+            except Exception as e:
+                print(f"Chittorgarh {kind} Error: {e}")
+                traceback.print_exc()
         print(f"Chittorgarh total: Bulk {len(bulk)}, Block {len(block)}")
         return bulk, block
 
-    # ---------- 4. BULK/BLOCK VIA NSE API VIA PROXY ----------
     def get_nse_bulk_block_via_proxy():
         bulk, block = [], []
         for kind, url in [
@@ -241,9 +217,9 @@ try:
             pdf.multi_cell(0, 6, str(a.get('title','')).encode('ascii','ignore').decode())
             if a.get('link'):
                 pdf.set_font("Helvetica", "", 8)
-                pdf.set_text_color(0,0,255)
+                pdf.set_text_color(0, 0, 255)
                 pdf.multi_cell(0, 5, f"Link: {str(a['link'])[:180]}")
-                pdf.set_text_color(0,0,0)
+                pdf.set_text_color(0, 0, 0)
             pdf.ln(4)
         pdf.output(filename)
         return filename
@@ -267,8 +243,7 @@ try:
         except:
             pass
 
-    # ---- Fetch All via Proxy / Chittorgarh ----
-    bse_data = get_bse_all_via_moneycontrol()
+    bse_data = get_bse_all()
     nse_data = get_nse_ann()
     nse_bulk_api, nse_block_api = get_nse_bulk_block_via_proxy()
     chit_bulk, chit_block = get_bulk_block_via_chittorgarh()
@@ -282,7 +257,6 @@ try:
         sym_norm = normalize(sym)
         sym_prefix = sym_norm[:6] if len(sym_norm) >= 6 else sym_norm
 
-        # Announcements
         matched = []
         for item in bse_data:
             if not isinstance(item, dict):
@@ -301,99 +275,4 @@ try:
             if not isinstance(item, dict):
                 continue
             if str(item.get("symbol", "")).upper().strip() == sym:
-                title = item.get("subject", "") or ""
-                time_str = item.get("annDate", "") or ""
-                uid = make_id(sym, title, time_str)
-                if uid in sent_history:
-                    continue
-                matched.append({"source": "NSE", "time": time_str, "title": title, "link": item.get("attachment", "") or "", "uid": uid})
-        if matched:
-            pdf_file = make_pdf(sym, matched, "ANNOUNCEMENT")
-            if send_pdf(pdf_file, sym, len(matched), "ANNOUNCEMENT"):
-                for m in matched:
-                    new_ids.append(m['uid'])
-                with_news.append(f"{sym} Ann ({len(matched)})")
-                sent_now += 1
-            time.sleep(1.5)
-
-        # Bulk - NSE API via proxy + Chittorgarh
-        bulk_matched = []
-        for item in nse_bulk_api:
-            if str(item.get("symbol", "")).upper().strip() == sym:
-                title = f"{item.get('buySell','')} - {item.get('clientName','')} - Qty: {item.get('quantityTraded','')} @ Rs {item.get('tradePrice','')}"
-                uid = make_id(sym, title, str(item.get("date","")))
-                if uid in sent_history:
-                    continue
-                bulk_matched.append({"source": "NSE BULK", "time": str(item.get("date","")), "title": title, "link": "", "uid": uid})
-        # Chittorgarh - match by company name in raw text
-        for item in chit_bulk:
-            comp_norm = normalize(item.get("company", ""))
-            # Chittorgarh company like "Aavas Financiers Ltd" -> normalize -> AAVASFINANCIERS
-            # Symbol AAVAS -> check if symbol in company OR company starts with symbol
-            if comp_norm and (sym_norm in comp_norm or comp_norm.startswith(sym_norm[:5]) or sym_norm[:5] in comp_norm):
-                cols = item.get("cols", [])
-                title = f"BULK - {' | '.join(cols[:5])}"
-                uid = make_id(sym, title, item.get("date",""))
-                if uid in sent_history:
-                    continue
-                bulk_matched.append({"source": "CHITTORGARH BULK", "time": item.get("date",""), "title": title, "link": "", "uid": uid})
-        if bulk_matched:
-            pdf_file = make_pdf(sym, bulk_matched, "BULK")
-            if send_pdf(pdf_file, sym, len(bulk_matched), "BULK"):
-                for m in bulk_matched:
-                    new_ids.append(m['uid'])
-                with_news.append(f"{sym} Bulk ({len(bulk_matched)})")
-                sent_now += 1
-            time.sleep(1.5)
-
-        # Block
-        block_matched = []
-        for item in nse_block_api:
-            if str(item.get("symbol", "")).upper().strip() == sym:
-                title = f"{item.get('buySell','')} - {item.get('clientName','')} - Qty: {item.get('quantityTraded','')} @ Rs {item.get('tradePrice','')}"
-                uid = make_id(sym, title, str(item.get("date","")))
-                if uid in sent_history:
-                    continue
-                block_matched.append({"source": "NSE BLOCK", "time": str(item.get("date","")), "title": title, "link": "", "uid": uid})
-        for item in chit_block:
-            comp_norm = normalize(item.get("company", ""))
-            if comp_norm and (sym_norm in comp_norm or comp_norm.startswith(sym_norm[:5]) or sym_norm[:5] in comp_norm):
-                cols = item.get("cols", [])
-                title = f"BLOCK - {' | '.join(cols[:5])}"
-                uid = make_id(sym, title, item.get("date",""))
-                if uid in sent_history:
-                    continue
-                block_matched.append({"source": "CHITTORGARH BLOCK", "time": item.get("date",""), "title": title, "link": "", "uid": uid})
-        if block_matched:
-            pdf_file = make_pdf(sym, block_matched, "BLOCK")
-            if send_pdf(pdf_file, sym, len(block_matched), "BLOCK"):
-                for m in block_matched:
-                    new_ids.append(m['uid'])
-                with_news.append(f"{sym} Block ({len(block_matched)})")
-                sent_now += 1
-            time.sleep(1.5)
-
-    for uid in new_ids:
-        sent_history[uid] = now.strftime("%Y-%m-%d")
-    try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(sent_history, f, indent=2)
-        print(f"History saved: {len(sent_history)} ids")
-    except Exception as e:
-        print(f"History save failed: {e}")
-
-    if sent_now == 0:
-        print("No NEW - Silent")
-        if len(bse_data) == 0 and len(nse_data) == 0 and len(chit_bulk) == 0:
-            print("WARNING: ALL sources blocked - will retry next run")
-    else:
-        send_text(f"✅ <b>Done - {today_display} {now.strftime('%I:%M %p')}</b>\n\nNew PDFs sent: {sent_now}\nStocks: {', '.join(with_news)}")
-
-except Exception as e:
-    print("FATAL ERROR:")
-    traceback.print_exc()
-    try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": f"❌ Holdings Bot Error:\n{str(e)[:500]}"}, timeout=20)
-    except:
-        pass
-    sys.exit(0)
+                title = item.get("subject", "") or
