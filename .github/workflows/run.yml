@@ -1,0 +1,24 @@
+name: Check fundamental3
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests beautifulsoup4
+      - run: python channel_filter.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@bot.com"
+          git add last_id.txt || true
+          git commit -m "update last_id" || true
+          git push || true
