@@ -1,5 +1,0 @@
-fpdf2
-pytz
-requests
-pandas
-yfinance
