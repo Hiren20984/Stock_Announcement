@@ -1,11 +1,5 @@
-import os, json, requests, datetime, pytz, time, hashlib, sys, traceback, re
+import os, json, requests, datetime, pytz, time, hashlib, sys, traceback
 from fpdf import FPDF
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except:
-    HAS_BS4 = False
-    print('bs4 not installed')
 
 TOKEN = os.getenv('TELEGRAM_TOKEN_HOLDINGS')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID_HOLDINGS')
@@ -19,6 +13,7 @@ now = datetime.datetime.now(IST)
 today_display = now.strftime('%d %b %Y')
 today_str = now.strftime('%Y%m%d')
 yesterday = now - datetime.timedelta(days=1)
+yesterday_str = yesterday.strftime('%Y%m%d')
 HISTORY_FILE = 'sent_history.json'
 
 def normalize(s):
@@ -26,7 +21,7 @@ def normalize(s):
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept': 'application/json, text/html, */*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Referer': 'https://www.google.com/',
 }
@@ -65,133 +60,100 @@ try:
         raw = raw.upper().strip()
         return hashlib.md5(raw.encode()).hexdigest()[:12]
 
-    # ---------- BULK / BLOCK FROM 5PAISA + TAPETIDE ----------
-    def fetch_table_rows(url):
+    def safe_json(r):
         try:
-            print(f'Fetching {url}')
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            print(f'  -> status {r.status_code} len {len(r.text)}')
-            if r.status_code != 200:
-                return []
-            if len(r.text) < 2000:
-                print('  -> too short, likely block page')
-                return []
-            soup = BeautifulSoup(r.text, 'html.parser')
-            tables = soup.find_all('table')
-            print(f'  -> found {len(tables)} tables')
-            all_rows = []
-            for table in tables:
-                rows = table.find_all('tr')
-                if not rows:
-                    continue
-                header = [c.get_text(strip=True) for c in rows[0].find_all(['th', 'td'])]
-                print(f'  -> header: {header}')
-                # Only accept tables that look like deals: has Stock/Company + Client + Quantity/Price
-                header_text = ' '.join(header).lower()
-                if 'client' not in header_text and 'stock' not in header_text and 'company' not in header_text:
-                    continue
-                for row in rows[1:]:
-                    cols = [c.get_text(strip=True) for c in row.find_all('td')]
-                    if len(cols) < 5:
-                        continue
-                    if not cols[0]:
-                        continue
-                    all_rows.append(cols)
-            print(f'  -> parsed {len(all_rows)} deal rows from {url}')
-            return all_rows
+            txt = r.text.strip()
+            if not txt or txt.startswith('<'):
+                print(f'HTML not JSON status {r.status_code} len {len(txt)}')
+                return {}
+            return r.json()
         except Exception as e:
-            print(f'Fetch error {url}: {e}')
-            traceback.print_exc()
-            return []
+            print(f'JSON parse failed: {e}')
+            return {}
 
-    def get_bulk_block():
+    def get_bse_ann():
+        all_rows = []
+        for d in [yesterday_str, today_str]:
+            try:
+                s = requests.Session()
+                s.headers.update(HEADERS)
+                try:
+                    s.get('https://www.bseindia.com/', timeout=20)
+                    time.sleep(1)
+                except:
+                    pass
+                url = 'https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w'
+                payload = {'strCat': '-1', 'strPrevDate': d, 'strScrip': '', 'strSearch': 'P', 'strToDate': d, 'strType': 'C', 'subcategory': '-1'}
+                h = dict(HEADERS)
+                h.update({'Referer': 'https://www.bseindia.com/corporates/ann.html', 'Content-Type': 'application/json'})
+                r = s.post(url, headers=h, json=payload, timeout=30)
+                print(f'BSE Ann {d}: status {r.status_code}')
+                if r.status_code == 200:
+                    data = safe_json(r)
+                    rows = data.get('Table', []) if isinstance(data, dict) else []
+                    print(f'BSE Ann {d}: {len(rows)} rows')
+                    all_rows.extend(rows)
+            except Exception as e:
+                print(f'BSE Ann Error {d}: {e}')
+        seen = set()
+        uniq = []
+        for row in all_rows:
+            k = f"{row.get('HEADLINE','')}|{row.get('DT_TM','')}|{row.get('SCRIP_CD','')}"
+            if k not in seen:
+                seen.add(k)
+                uniq.append(row)
+        print(f'BSE Ann total: {len(uniq)}')
+        return uniq
+
+    def get_nse_ann():
+        try:
+            s = requests.Session()
+            s.headers.update(HEADERS)
+            try:
+                s.get('https://www.nseindia.com', timeout=20)
+                time.sleep(1)
+            except:
+                pass
+            url = 'https://www.nseindia.com/api/corporate-announcements?index=equities&symbol='
+            r = s.get(url, timeout=30)
+            print(f'NSE Ann: status {r.status_code}')
+            if r.status_code == 200:
+                data = safe_json(r)
+                rows = data.get('data', []) if isinstance(data, dict) else []
+                print(f'NSE Ann: {len(rows)} rows')
+                return rows
+        except Exception as e:
+            print(f'NSE Ann Error: {e}')
+        return []
+
+    def get_nse_bulk_block():
         bulk = []
         block = []
-        # Try multiple URLs - first one that returns rows wins
-        urls_5paisa = [
-            'https://www.5paisa.com/research/bulk-block-deals',
-            'https://www.5paisa.com/stocks/bulk-block-deals',
-            'https://www.5paisa.com/bulk-block-deals',
-        ]
-        urls_tapetide = [
-            'https://tapetide.com/bulk-block-deals',
-            'https://tapetide.com/',
-        ]
-        all_rows = []
-        for u in urls_5paisa:
-            rows = fetch_table_rows(u)
-            if rows:
-                print(f'5PAISA SUCCESS from {u}')
-                all_rows.extend(rows)
-                break
-        if not all_rows:
-            for u in urls_tapetide:
-                rows = fetch_table_rows(u)
-                if rows:
-                    print(f'TAPETIDE SUCCESS from {u}')
-                    all_rows.extend(rows)
-                    break
-        print(f'TOTAL deal rows fetched: {len(all_rows)}')
-        # Parse rows: 5paisa format = Stock | Client | Exchange | Deal Type | Action | Date | Price | Qty
-        # Tapetide format = Company | Deal Type | Exchange | Date | Client | Action | Qty | Price
-        for cols in all_rows:
-            text = ' | '.join(cols)
-            text_lower = text.lower()
-            # Determine deal type
-            is_block = 'block' in text_lower
-            is_bulk = 'bulk' in text_lower
-            # Company is usually cols[0]
-            company = cols[0]
-            item = {'company': company, 'cols': cols, 'raw': text, 'date': today_display}
-            if is_block:
-                block.append(item)
-            elif is_bulk:
-                bulk.append(item)
-            else:
-                # If no type in row, treat as bulk (most deals are bulk)
-                bulk.append(item)
-        print(f'Parsed: Bulk {len(bulk)}, Block {len(block)}')
-        return bulk, block
-
-    # ---------- ANNOUNCEMENTS FROM MONEYCONTROL + 5PAISA ----------
-    def get_announcements():
-        # Moneycontrol + 5paisa announcements pages - try both, take first that works
-        ann = []
-        urls = [
-            'https://www.moneycontrol.com/company-announcements/',
-            'https://www.moneycontrol.com/news/business/stocks/',
-            'https://www.5paisa.com/research/corporate-announcements',
-        ]
-        for url in urls:
+        try:
+            s = requests.Session()
+            s.headers.update(HEADERS)
             try:
-                print(f'Fetching announcements {url}')
-                r = requests.get(url, headers=HEADERS, timeout=30)
-                print(f'  -> status {r.status_code} len {len(r.text)}')
-                if r.status_code != 200 or len(r.text) < 2000:
-                    continue
-                soup = BeautifulSoup(r.text, 'html.parser')
-                # Find links with company-like titles
-                links = soup.find_all('a')
-                count = 0
-                for a in links:
-                    txt = a.get_text(strip=True)
-                    href = a.get('href', '')
-                    if len(txt) < 20 or len(txt) > 200:
-                        continue
-                    # Skip nav links
-                    if txt.lower() in ['home', 'markets', 'news', 'more', 'login', 'sign up']:
-                        continue
-                    # Keep if it looks like announcement title
-                    if any(k in txt.lower() for k in ['result', 'dividend', 'board', 'meeting', 'announce', 'allot', 'issue', 'buyback', 'split', 'bonus', 'agreement', 'order', 'contract']):
-                        ann.append({'company': '', 'title': txt, 'link': href, 'time': today_display})
-                        count += 1
-                print(f'  -> {url} gave {count} announcement-like titles')
-                if count > 5:
-                    break
-            except Exception as e:
-                print(f'Ann fetch error {url}: {e}')
-        print(f'Total announcements fetched: {len(ann)}')
-        return ann
+                s.get('https://www.nseindia.com', timeout=20)
+                time.sleep(1)
+            except:
+                pass
+            for kind, url in [('bulk', 'https://www.nseindia.com/api/corporates-bulk-deals?index=equities'), ('block', 'https://www.nseindia.com/api/corporates-block-deals?index=equities')]:
+                try:
+                    r = s.get(url, timeout=30)
+                    print(f'NSE {kind}: status {r.status_code}')
+                    if r.status_code == 200:
+                        data = safe_json(r)
+                        rows = data.get('data', []) if isinstance(data, dict) else []
+                        print(f'NSE {kind}: {len(rows)} rows')
+                        if kind == 'bulk':
+                            bulk = rows
+                        else:
+                            block = rows
+                except Exception as e:
+                    print(f'NSE {kind} Error: {e}')
+        except Exception as e:
+            print(f'NSE Bulk Block Error: {e}')
+        return bulk, block
 
     def make_pdf(symbol, items, deal_type='ANNOUNCEMENT'):
         filename = f'{symbol}_{deal_type}_{now.strftime("%d%b%Y_%H%M")}.pdf'
@@ -256,9 +218,10 @@ try:
         except:
             pass
 
-    bulk_list, block_list = get_bulk_block()
-    ann_list = get_announcements()
-    print(f'TOTAL FETCHED -> Bulk: {len(bulk_list)}, Block: {len(block_list)}, Ann: {len(ann_list)}')
+    bse_data = get_bse_ann()
+    nse_data = get_nse_ann()
+    nse_bulk, nse_block = get_nse_bulk_block()
+    print(f'TOTAL FETCHED -> BSE Ann: {len(bse_data)}, NSE Ann: {len(nse_data)}, Bulk: {len(nse_bulk)}, Block: {len(nse_block)}')
 
     sent_now = 0
     with_news = []
@@ -266,25 +229,57 @@ try:
 
     for sym in symbols:
         sym_norm = normalize(sym)
-        if len(sym_norm) >= 5:
-            sym_key = sym_norm[:5]
+        if len(sym_norm) >= 6:
+            sym_prefix = sym_norm[:6]
         else:
-            sym_key = sym_norm
+            sym_prefix = sym_norm
 
-        # Bulk matching - company name contains symbol key
+        matched = []
+        for item in bse_data:
+            if not isinstance(item, dict):
+                continue
+            name_norm = normalize(item.get('SLONGNAME', ''))
+            if name_norm and (sym_norm in name_norm or name_norm.startswith(sym_prefix)):
+                title = item.get('HEADLINE', '') or ''
+                time_str = item.get('DT_TM', '') or ''
+                uid = make_id(sym, title, time_str)
+                if uid in sent_history:
+                    continue
+                attach = item.get('ATTACHMENTNAME', '') or ''
+                link = f'https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attach}' if attach else ''
+                matched.append({'source': 'BSE', 'time': time_str, 'title': title, 'link': link, 'uid': uid})
+        for item in nse_data:
+            if not isinstance(item, dict):
+                continue
+            sym_val = str(item.get('symbol', '')).upper().strip()
+            if sym_val == sym:
+                title = item.get('subject', '') or ''
+                time_str = item.get('annDate', '') or ''
+                uid = make_id(sym, title, time_str)
+                if uid in sent_history:
+                    continue
+                att = item.get('attachment', '') or ''
+                matched.append({'source': 'NSE', 'time': time_str, 'title': title, 'link': att, 'uid': uid})
+        if matched:
+            pdf_file = make_pdf(sym, matched, 'ANNOUNCEMENT')
+            ok = send_pdf(pdf_file, sym, len(matched), 'ANNOUNCEMENT')
+            if ok:
+                for m in matched:
+                    new_ids.append(m['uid'])
+                with_news.append(f'{sym} Ann ({len(matched)})')
+                sent_now += 1
+            time.sleep(1.5)
+
         bulk_matched = []
-        for item in bulk_list:
-            comp = item.get('company', '')
-            comp_norm = normalize(comp)
-            if comp_norm and (sym_norm in comp_norm or comp_norm.startswith(sym_key) or sym_key in comp_norm):
-                cols = item.get('cols', [])
-                joined = ' | '.join(cols[:8])
-                title = f'BULK - {joined}'
-                dt = item.get('date', '')
+        for item in nse_bulk:
+            sym_val = str(item.get('symbol', '')).upper().strip()
+            if sym_val == sym:
+                title = f"{item.get('buySell','')} - {item.get('clientName','')} - Qty: {item.get('quantityTraded','')} @ Rs {item.get('tradePrice','')}"
+                dt = str(item.get('date', ''))
                 uid = make_id(sym, title, dt)
                 if uid in sent_history:
                     continue
-                bulk_matched.append({'source': '5PAISA/TAPETIDE BULK', 'time': dt, 'title': title, 'link': '', 'uid': uid})
+                bulk_matched.append({'source': 'NSE BULK', 'time': dt, 'title': title, 'link': '', 'uid': uid})
         if bulk_matched:
             pdf_file = make_pdf(sym, bulk_matched, 'BULK')
             ok = send_pdf(pdf_file, sym, len(bulk_matched), 'BULK')
@@ -296,18 +291,15 @@ try:
             time.sleep(1.5)
 
         block_matched = []
-        for item in block_list:
-            comp = item.get('company', '')
-            comp_norm = normalize(comp)
-            if comp_norm and (sym_norm in comp_norm or comp_norm.startswith(sym_key) or sym_key in comp_norm):
-                cols = item.get('cols', [])
-                joined = ' | '.join(cols[:8])
-                title = f'BLOCK - {joined}'
-                dt = item.get('date', '')
+        for item in nse_block:
+            sym_val = str(item.get('symbol', '')).upper().strip()
+            if sym_val == sym:
+                title = f"{item.get('buySell','')} - {item.get('clientName','')} - Qty: {item.get('quantityTraded','')} @ Rs {item.get('tradePrice','')}"
+                dt = str(item.get('date', ''))
                 uid = make_id(sym, title, dt)
                 if uid in sent_history:
                     continue
-                block_matched.append({'source': '5PAISA/TAPETIDE BLOCK', 'time': dt, 'title': title, 'link': '', 'uid': uid})
+                block_matched.append({'source': 'NSE BLOCK', 'time': dt, 'title': title, 'link': '', 'uid': uid})
         if block_matched:
             pdf_file = make_pdf(sym, block_matched, 'BLOCK')
             ok = send_pdf(pdf_file, sym, len(block_matched), 'BLOCK')
@@ -315,28 +307,6 @@ try:
                 for m in block_matched:
                     new_ids.append(m['uid'])
                 with_news.append(f'{sym} Block ({len(block_matched)})')
-                sent_now += 1
-            time.sleep(1.5)
-
-        # Announcements - match by title containing symbol or company name
-        # For now, only send announcements if title contains symbol (strict, avoids spam)
-        ann_matched = []
-        for item in ann_list:
-            ttl = item.get('title', '')
-            ttl_norm = normalize(ttl)
-            if sym_norm in ttl_norm or sym_key in ttl_norm:
-                dt = item.get('date', '')
-                uid = make_id(sym, ttl, dt)
-                if uid in sent_history:
-                    continue
-                ann_matched.append({'source': 'MONEYCONTROL', 'time': dt, 'title': ttl, 'link': item.get('link', ''), 'uid': uid})
-        if ann_matched:
-            pdf_file = make_pdf(sym, ann_matched, 'ANNOUNCEMENT')
-            ok = send_pdf(pdf_file, sym, len(ann_matched), 'ANNOUNCEMENT')
-            if ok:
-                for m in ann_matched:
-                    new_ids.append(m['uid'])
-                with_news.append(f'{sym} Ann ({len(ann_matched)})')
                 sent_now += 1
             time.sleep(1.5)
 
@@ -351,8 +321,6 @@ try:
 
     if sent_now == 0:
         print('No NEW - Silent')
-        if len(bulk_list) == 0 and len(block_list) == 0 and len(ann_list) == 0:
-            print('WARNING: ALL sources blocked - need Render move')
     else:
         send_text(f'✅ <b>Done - {today_display} {now.strftime("%I:%M %p")}</b>\n\nNew PDFs sent: {sent_now}\nStocks: {", ".join(with_news)}')
 
