@@ -1,4 +1,0 @@
-requests
-fpdf2
-pytz
-beautifulsoup4
